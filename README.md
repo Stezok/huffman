@@ -1,2 +1,2 @@
-# gohuffman
+# Huffman
 Golang archivator. Huffman algo.
