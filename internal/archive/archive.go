@@ -1,18 +1,21 @@
 package archive
 
 import (
-	"bytes"
 	"encoding/binary"
+	"errors"
+	"fmt"
 	"io"
+	"log"
 	"os"
 )
 
-const BUFFER_SIZE = 0x20000
-const ENCODED_LIM = 0x200
+const (
+	BLOCK_SIZE = 0x10000
+)
 
-type Logger interface {
-	Print(...interface{})
-}
+var (
+	EmptyFileError = errors.New("File is empty or unreadable")
+)
 
 type Node struct {
 	Weight uint32
@@ -21,33 +24,49 @@ type Node struct {
 	Right  *Node
 }
 
-type Archiver struct {
-	logger Logger
+func toBitsAsString(b byte) string {
+	var result string
+	for i := 7; i >= 0; i-- {
+		result = fmt.Sprint(result, b>>i&1)
+	}
+	return result
 }
 
-func (arch *Archiver) countByteMeet(r io.Reader) ([256]uint32, error) {
-	var byteMeetCount [256]uint32
+type bitString string
 
-	outBuffer := bytes.NewBuffer([]byte{})
+func (bs bitString) AsByteSlice() (bytes []byte, extra string) {
+	for len(bs) >= 8 {
+		stringByte := bs[:8]
+		bs = bs[8:]
 
-	readBuffer := make([]byte, BUFFER_SIZE)
+		var byteValue byte
+		for i := 0; i < 8; i++ {
+			byteValue = byteValue<<1 + (stringByte[i] - '0')
+		}
+		bytes = append(bytes, byteValue)
+	}
+	extra = string(bs)
+	return
+}
 
-	var err error
+type Archiver struct {
+}
+
+func (arch *Archiver) countBytes(r io.Reader) (byteCount [256]uint32, err error) {
+	buf := make([]byte, BLOCK_SIZE)
+
 	var read int
 	for err != io.EOF {
-		read, err = r.Read(readBuffer)
+		read, err = r.Read(buf)
 		if err != nil && err != io.EOF {
-			arch.logger.Print(err)
-			return byteMeetCount, err
+			return
 		}
-
-		outBuffer.Write(readBuffer[:read])
 
 		for i := 0; i < read; i++ {
-			byteMeetCount[int(readBuffer[i])]++
+			byteCount[int(buf[i])]++
 		}
 	}
-	return byteMeetCount, nil
+	return byteCount, nil
 }
 
 func (arch *Archiver) fillMap(node *Node, code string, m map[byte]string) {
@@ -60,8 +79,9 @@ func (arch *Archiver) fillMap(node *Node, code string, m map[byte]string) {
 	arch.fillMap(node.Right, code+"0", m)
 }
 
-func (arch *Archiver) buildMap(byteMeetCount [256]uint32) map[byte]string {
-	nodePool := []*Node{}
+//////////////////////////////
+func (arch *Archiver) buildTree(byteMeetCount [256]uint32) (*Node, error) {
+	var nodePool []*Node
 	for i := 0; i < 256; i++ {
 		if byteMeetCount[i] != 0 {
 			nodePool = append(nodePool, &Node{
@@ -71,6 +91,10 @@ func (arch *Archiver) buildMap(byteMeetCount [256]uint32) map[byte]string {
 				Right:  nil,
 			})
 		}
+	}
+
+	if len(nodePool) == 0 {
+		return nil, EmptyFileError
 	}
 
 	times := len(nodePool) - 1
@@ -88,9 +112,6 @@ func (arch *Archiver) buildMap(byteMeetCount [256]uint32) map[byte]string {
 			}
 		}
 
-		if ind1 > ind2 {
-			ind1, ind2 = ind2, ind1
-		}
 		newNode := &Node{
 			Weight: nodePool[ind1].Weight + nodePool[ind2].Weight,
 			Left:   nodePool[ind1],
@@ -105,51 +126,43 @@ func (arch *Archiver) buildMap(byteMeetCount [256]uint32) map[byte]string {
 			newNodePool = append(newNodePool, nodePool[i])
 		}
 		newNodePool = append(newNodePool, newNode)
+		nodePool = newNodePool
+	}
 
-		for i := len(newNodePool); i < len(nodePool); i++ {
-			nodePool[i] = nil
-		}
+	return nodePool[0], nil
+}
+
+func (arch *Archiver) buildMap(byteMeetCount [256]uint32) (map[byte]string, error) {
+
+	root, err := arch.buildTree(byteMeetCount)
+	if err != nil {
+		return nil, err
 	}
 
 	m := make(map[byte]string)
-	arch.fillMap(nodePool[0], "", m)
+	arch.fillMap(root, "", m)
 
-	return m
-}
-
-type bitString string
-
-func (bs bitString) AsByteSlice() (result []byte, extra string) {
-	var bytes []byte
-	for len(bs) >= 8 {
-		stringByte := bs[:8]
-		var byteValue byte
-		for len(stringByte) != 0 {
-			byteValue = byteValue<<1 + stringByte[len(stringByte)-1]
-			stringByte = stringByte[:len(stringByte)-1]
-		}
-		bytes = append(bytes, byteValue)
-	}
-	return bytes, string(bs)
+	return m, nil
 }
 
 func (arhc *Archiver) writeEncoded(encoded *string, w io.Writer) error {
 	var bytes []byte
 	bytes, *encoded = bitString(*encoded).AsByteSlice()
+	if len(bytes) == 0 {
+		log.Print("+")
+		return nil
+	}
+	log.Print("!@!", bytes)
 	_, err := w.Write(bytes)
 	return err
 }
 
 func (arch *Archiver) archiveFile(r io.Reader, byteMeetCount [256]uint32, w io.Writer) error {
-	codeTable := arch.buildMap(byteMeetCount)
-
-	var lastByteLen byte
-	for byteVal, count := range byteMeetCount {
-		add := byte(count) * byte(len(codeTable[byte(byteVal)]))
-		lastByteLen = (lastByteLen + add) % 8
+	codeTable, err := arch.buildMap(byteMeetCount)
+	if err != nil {
+		return err
 	}
-
-	var err error
+	log.Print(codeTable)
 	for _, count := range byteMeetCount {
 		block := make([]byte, 4)
 		binary.BigEndian.PutUint32(block[0:4], count)
@@ -159,6 +172,11 @@ func (arch *Archiver) archiveFile(r io.Reader, byteMeetCount [256]uint32, w io.W
 		}
 	}
 
+	var lastByteLen byte
+	for byteVal, count := range byteMeetCount {
+		add := byte(count) * byte(len(codeTable[byte(byteVal)]))
+		lastByteLen = (lastByteLen + add) % 8
+	}
 	_, err = w.Write([]byte{lastByteLen})
 	if err != nil {
 		return err
@@ -166,12 +184,10 @@ func (arch *Archiver) archiveFile(r io.Reader, byteMeetCount [256]uint32, w io.W
 
 	var read int
 	var encoded string
-	readBuffer := make([]byte, BUFFER_SIZE)
-
+	readBuffer := make([]byte, BLOCK_SIZE)
 	for err != io.EOF {
 		read, err = r.Read(readBuffer)
 		if err != nil && err != io.EOF {
-			arch.logger.Print(err)
 			return err
 		}
 
@@ -183,7 +199,6 @@ func (arch *Archiver) archiveFile(r io.Reader, byteMeetCount [256]uint32, w io.W
 			}
 		}
 	}
-
 	err = arch.writeEncoded(&encoded, w)
 	if err != nil {
 		return err
@@ -193,6 +208,7 @@ func (arch *Archiver) archiveFile(r io.Reader, byteMeetCount [256]uint32, w io.W
 		for len(encoded) != 8 {
 			encoded += "0"
 		}
+		log.Print(encoded)
 		err = arch.writeEncoded(&encoded, w)
 		if err != nil {
 			return err
@@ -209,7 +225,7 @@ func (arch *Archiver) Compress(filename string, output io.Writer) error {
 	}
 	defer file.Close()
 
-	byteMeetCount, err := arch.countByteMeet(file)
+	byteMeetCount, err := arch.countBytes(file)
 	if err != nil {
 		return err
 	}
@@ -220,12 +236,137 @@ func (arch *Archiver) Compress(filename string, output io.Writer) error {
 	return nil
 }
 
-func (arhc *Archiver) Decompress(r io.Reader, w io.WriteCloser) error {
+func (arch *Archiver) readMeta(r io.Reader) ([256]uint32, byte, error) {
+	buffer := make([]byte, 4)
+	var byteMeetCount [256]uint32
+
+	for i := 0; i < 256; i++ {
+		_, err := r.Read(buffer)
+		if err != nil {
+			return [256]uint32{}, 0, err
+		}
+
+		byteMeetCount[i] = binary.BigEndian.Uint32(buffer)
+	}
+
+	buffer = make([]byte, 1)
+	_, err := r.Read(buffer)
+	if err != nil {
+		return [256]uint32{}, 0, err
+	}
+
+	return byteMeetCount, buffer[0], nil
+}
+
+func nextNode(node *Node, code byte) (*Node, byte) {
+	log.Print("@@", node.Weight)
+	log.Print("@@@", string(code))
+	if node == nil {
+		return nil, 0
+	}
+
+	switch code {
+	case '0':
+		return node.Right, node.Right.Data
+	case '1':
+		return node.Left, node.Left.Data
+	default:
+		return nil, 0
+	}
+}
+
+func (arhc *Archiver) decode(r io.Reader, root *Node, lastByteLength byte, w io.Writer) error {
+	buffer := make([]byte, BLOCK_SIZE)
+	writeBuffer := make([]byte, BLOCK_SIZE)
+	writeIter := 0
+	var bits string
+	nodeIter := root
+
+	var err error
+	for err != io.EOF {
+		var n int
+		n, err = r.Read(buffer)
+		if err != nil && err != io.EOF {
+			return err
+		}
+		log.Print(buffer[:n])
+		for i := 0; i < n; i++ {
+			bits += toBitsAsString(buffer[i])
+		}
+
+		if err == io.EOF {
+			var cutBits int
+			cutBits = 8 - int(lastByteLength)
+			if lastByteLength == 0 {
+				cutBits = 0
+			}
+			bits = bits[:len(bits)-cutBits]
+		}
+		log.Print("!!!", bits)
+		for len(bits) > 8 {
+			var decoded byte
+			nodeIter, decoded = nextNode(nodeIter, bits[0])
+			if nodeIter.Left == nodeIter.Right {
+				nodeIter = root
+
+				writeBuffer[writeIter] = decoded
+				writeIter++
+				if writeIter == len(writeBuffer) {
+					_, err = w.Write(writeBuffer)
+					if err != nil {
+						return err
+					}
+					writeIter = 0
+				}
+			}
+			bits = bits[1:]
+		}
+	}
+	for len(bits) > 0 {
+		var decoded byte
+		nodeIter, decoded = nextNode(nodeIter, bits[0])
+		log.Print(string(decoded))
+		if nodeIter.Left == nodeIter.Right {
+			nodeIter = root
+
+			writeBuffer[writeIter] = decoded
+			writeIter++
+			if writeIter == len(writeBuffer) {
+				_, err = w.Write(writeBuffer)
+				if err != nil {
+					return err
+				}
+				writeIter = 0
+			}
+		}
+		bits = bits[1:]
+	}
+
+	if writeIter != 0 {
+		_, err = w.Write(writeBuffer[:writeIter])
+		if err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
-func NewArchiver(logger Logger) *Archiver {
-	return &Archiver{
-		logger: logger,
+func (arch *Archiver) Decompress(r io.Reader, w io.Writer) error {
+	byteMeetCount, lastByteLength, err := arch.readMeta(r)
+	log.Print(byteMeetCount)
+	log.Print(lastByteLength)
+
+	root, err := arch.buildTree(byteMeetCount)
+	if err != nil {
+		return err
 	}
+	log.Print(root.Weight)
+
+	arch.decode(r, root, lastByteLength, w)
+
+	return nil
+}
+
+func NewArchiver() *Archiver {
+	return &Archiver{}
 }
